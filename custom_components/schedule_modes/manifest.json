@@ -2,16 +2,14 @@
   "domain": "schedule_modes",
   "name": "Schedule Modes",
   "version": "0.0.1",
-  "documentation": "https://github.com/OnOff-Automations/schedule_mode_ha",
-  "issue_tracker": "https://github.com/OnOff-Automations/schedule_mode_ha/issues",
+  "documentation": "https://github.com/onoffautomations/schedule_mode",
+  "issue_tracker": "https://github.com/onoffautomations/schedule_mode/issues",
   "requirements": [
     "pyluach==2.2.0",
-    "hdate>=0.10.11",
-    "astral==2.2"
+    "hdate>=0.10.11"
   ],
   "config_flow": true,
   "integration_type": "hub",
   "codeowners": ["@OnOff-Automations"],
   "iot_class": "local_push"
 }
-

@@ -1,0 +1,7 @@
+{
+  "name": "Schedule Modes Home Assistant Integration",
+  "zip_release": true,
+  "filename": "schedule_modes.zip",
+  "homeassistant": "2023.8.0",
+  "render_readme": true
+}

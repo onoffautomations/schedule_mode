@@ -15,6 +15,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import dt as dt_util
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import device_registry as dr
 
 # Jewish date/holiday libs (local, no HTTP)
 from zoneinfo import ZoneInfo
@@ -96,12 +97,64 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
     # Add custom calendars (normalized format)
     custom_calendars = normalize_custom_calendars(entry.options.get(OPT_CUSTOM_CALENDARS, []))
+    custom_cal_ids = []
     for custom_cal in custom_calendars:
         cal_id = custom_cal["id"]
         cal_name = custom_cal["name"]
+        custom_cal_ids.append(cal_id)
         entities.append(ModeCalendar(hass, entry, store, events, cal_id, custom_name=cal_name))
 
     entities.append(JewishDatesCalendar(hass, entry))
+
+    # Clean up removed custom calendar entities from entity registry
+    registry = er.async_get(hass)
+    all_entity_entries = er.async_entries_for_config_entry(registry, entry.entry_id)
+
+    for entity_entry in all_entity_entries:
+        # Check if this is a calendar entity
+        if entity_entry.domain == "calendar":
+            # Extract mode_key from unique_id (format: {entry_id}_calendar_{mode_key})
+            unique_id_parts = entity_entry.unique_id.split("_calendar_")
+            if len(unique_id_parts) == 2:
+                mode_key = unique_id_parts[1]
+
+                # Skip jewish_dates calendar
+                if mode_key == "jewish_dates":
+                    continue
+
+                # Check if this calendar is still in config
+                is_enabled_mode = mode_key in enabled
+                is_custom_calendar = mode_key in custom_cal_ids
+
+                # If not in either list, remove it
+                if not is_enabled_mode and not is_custom_calendar:
+                    _LOGGER.debug("Removing orphaned calendar entity: %s (mode_key: %s)",
+                                 entity_entry.entity_id, mode_key)
+                    registry.async_remove(entity_entry.entity_id)
+
+    # Clean up orphaned devices (devices with no entities left)
+    device_registry = dr.async_get(hass)
+    all_devices = dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+
+    for device_entry in all_devices:
+        # Check if this device has any entities left
+        device_entities = er.async_entries_for_device(registry, device_entry.id, include_disabled_entities=True)
+
+        # If the device has no entities, remove it
+        if not device_entities:
+            # Extract mode_key from device identifiers to log it
+            mode_key = None
+            for identifier_tuple in device_entry.identifiers:
+                if len(identifier_tuple) == 3 and identifier_tuple[0] == DOMAIN:
+                    mode_key = identifier_tuple[2]
+                    break
+
+            # Don't remove the main device
+            if mode_key != "main":
+                _LOGGER.debug("Removing orphaned device: %s (mode_key: %s)",
+                             device_entry.name, mode_key)
+                device_registry.async_remove_device(device_entry.id)
+
     async_add_entities(entities, True)
 
     # Dispatch initial events to sensor manager after calendars are created
@@ -121,7 +174,9 @@ class ModeCalendar(CalendarEntity):
         self._name = custom_name if custom_name else f"{mode_friendly(mode_key)}"
         self._attr_name = None  # Let Home Assistant use the device name only
         self._attr_unique_id = f"{entry.entry_id}_calendar_{mode_key}"
-        self._events_all: List[Dict[str, Any]] = list(events_all)
+        # IMPORTANT: Share the same events list reference across all calendars
+        # Don't create a copy with list() - all calendars must see the same events
+        self._events_all: List[Dict[str, Any]] = events_all
         self._event: Optional[CalendarEvent] = None
         self._unsub_tick = None
         # NEW: track if we enabled No Tachanun because of Bris
@@ -133,6 +188,14 @@ class ModeCalendar(CalendarEntity):
 
     @property
     def device_info(self) -> DeviceInfo:
+        # For custom calendars, use the custom name directly
+        if self.is_custom:
+            return {
+                "identifiers": {(DOMAIN, self.entry.entry_id, self.mode_key)},
+                "manufacturer": "OnOff Automations",
+                "name": self._name,
+                "model": "Mode",
+            }
         return device_info_for_mode(self.entry.entry_id, self.mode_key)
 
     @property

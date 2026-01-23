@@ -9,6 +9,7 @@ from homeassistant.helpers.event import async_track_state_change_event, async_tr
 from homeassistant.util import dt as dt_util
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import device_registry as dr
 
 from .const import (
     DOMAIN, OPT_ENABLED_MODES, EVENT_MODE_KEYS, OPT_CUSTOM_CALENDARS,
@@ -22,8 +23,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
     # Create binary sensors for enabled modes
     for k in enabled:
-        ents.append(ModeMirrorBinarySensor(hass, entry, k, mode_friendly(k)))
-        ents.append(ModeEventActiveBinarySensor(hass, entry, k, mode_friendly(k)))
+        ents.append(ModeMirrorBinarySensor(hass, entry, k, mode_friendly(k), is_custom=False))
+        ents.append(ModeEventActiveBinarySensor(hass, entry, k, mode_friendly(k), is_custom=False))
 
     # Create binary sensors for custom calendars (normalized format)
     custom_calendars = normalize_custom_calendars(entry.options.get(OPT_CUSTOM_CALENDARS, []))
@@ -31,9 +32,73 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     for custom_cal in custom_calendars:
         cal_id = custom_cal["id"]
         cal_name = custom_cal["name"]
-        ents.append(ModeMirrorBinarySensor(hass, entry, cal_id, cal_name))
-        ents.append(ModeEventActiveBinarySensor(hass, entry, cal_id, cal_name))
+        ents.append(ModeMirrorBinarySensor(hass, entry, cal_id, cal_name, is_custom=True))
+        ents.append(ModeEventActiveBinarySensor(hass, entry, cal_id, cal_name, is_custom=True))
         custom_cal_ids.append(cal_id)
+
+    # Clean up removed custom calendar binary sensor entities from entity registry
+    registry = er.async_get(hass)
+    all_entity_entries = er.async_entries_for_config_entry(registry, entry.entry_id)
+
+    for entity_entry in all_entity_entries:
+        # Check if this is a binary_sensor entity
+        if entity_entry.domain == "binary_sensor":
+            # Extract mode_key from unique_id
+            # Format can be: {entry_id}_{mode_key}_mirror or {entry_id}_{mode_key}_event_active
+            unique_id = entity_entry.unique_id
+
+            # Skip non-mode binary sensors
+            if unique_id.endswith("_event_modes") or unique_id.endswith("_event_running_with_override") or unique_id.endswith("_dst"):
+                continue
+
+            # Remove the entry_id prefix
+            if unique_id.startswith(f"{entry.entry_id}_"):
+                remainder = unique_id[len(f"{entry.entry_id}_"):]
+
+                # Extract mode_key
+                mode_key = None
+                if remainder.endswith("_mirror"):
+                    mode_key = remainder[:-len("_mirror")]
+                elif remainder.endswith("_event_active"):
+                    mode_key = remainder[:-len("_event_active")]
+
+                if mode_key:
+                    # Check if this mode/calendar is still in config
+                    is_enabled_mode = mode_key in enabled
+                    is_custom_calendar = mode_key in custom_cal_ids
+
+                    # If not in either list, remove it
+                    if not is_enabled_mode and not is_custom_calendar:
+                        from logging import getLogger
+                        _LOGGER = getLogger(__name__)
+                        _LOGGER.debug("Removing orphaned binary_sensor entity: %s (mode_key: %s)",
+                                     entity_entry.entity_id, mode_key)
+                        registry.async_remove(entity_entry.entity_id)
+
+    # Clean up orphaned devices (devices with no entities left)
+    device_registry = dr.async_get(hass)
+    all_devices = dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+
+    for device_entry in all_devices:
+        # Check if this device has any entities left
+        device_entities = er.async_entries_for_device(registry, device_entry.id, include_disabled_entities=True)
+
+        # If the device has no entities, remove it
+        if not device_entities:
+            # Extract mode_key from device identifiers to log it
+            mode_key = None
+            for identifier_tuple in device_entry.identifiers:
+                if len(identifier_tuple) == 3 and identifier_tuple[0] == DOMAIN:
+                    mode_key = identifier_tuple[2]
+                    break
+
+            # Don't remove the main device
+            if mode_key != "main":
+                from logging import getLogger
+                _LOGGER = getLogger(__name__)
+                _LOGGER.debug("Removing orphaned device: %s (mode_key: %s)",
+                             device_entry.name, mode_key)
+                device_registry.async_remove_device(device_entry.id)
 
     # Combine enabled modes and custom calendars for summary sensors
     all_modes = list(enabled) + custom_cal_ids
@@ -48,10 +113,12 @@ class ModeMirrorBinarySensor(BinarySensorEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_entity_registry_enabled_default = True
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, key: str, friendly: str):
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, key: str, friendly: str, is_custom: bool = False):
         self.hass = hass
         self._entry = entry
         self._key = key
+        self._friendly_name = friendly
+        self._is_custom = is_custom
         self._attr_name = f"{friendly} Active"
         self._attr_unique_id = f"{entry.entry_id}_{key}_mirror"
         self._switch_eid = None  # Will be resolved dynamically from registry
@@ -68,6 +135,14 @@ class ModeMirrorBinarySensor(BinarySensorEntity):
 
     @property
     def device_info(self):
+        # For custom calendars, use the custom name directly
+        if self._is_custom:
+            return {
+                "identifiers": {(DOMAIN, self._entry.entry_id, self._key)},
+                "manufacturer": "OnOff Automations",
+                "name": self._friendly_name,
+                "model": "Mode",
+            }
         return device_info_for_mode(self._entry.entry_id, self._key)
 
     async def async_added_to_hass(self):
@@ -181,10 +256,12 @@ class ModeEventActiveBinarySensor(BinarySensorEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_entity_registry_enabled_default = True
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, key: str, friendly: str):
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, key: str, friendly: str, is_custom: bool = False):
         self.hass = hass
         self._entry = entry
         self._key = key
+        self._friendly_name = friendly
+        self._is_custom = is_custom
         self._attr_name = f"{friendly} Event Active"
         self._attr_unique_id = f"{entry.entry_id}_{key}_event_active"
         self._active_helper = f"sensor.{DOMAIN}_active_{key}_event"
@@ -194,6 +271,14 @@ class ModeEventActiveBinarySensor(BinarySensorEntity):
 
     @property
     def device_info(self):
+        # For custom calendars, use the custom name directly
+        if self._is_custom:
+            return {
+                "identifiers": {(DOMAIN, self._entry.entry_id, self._key)},
+                "manufacturer": "OnOff Automations",
+                "name": self._friendly_name,
+                "model": "Mode",
+            }
         return device_info_for_mode(self._entry.entry_id, self._key)
 
     async def async_added_to_hass(self):

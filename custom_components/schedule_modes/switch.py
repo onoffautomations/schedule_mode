@@ -11,8 +11,11 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.util import dt as dt_util
 from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import device_registry as dr
 
 from .const import (
+    DOMAIN,
     OPT_ENABLED_MODES,
     OPT_DEFAULT_DURATIONS,
     OPT_AUTO_RESET_TIME,
@@ -33,18 +36,74 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entities: list[SwitchEntity] = []
     # Mode switches
     for k in enabled:
-        entities.append(ModeSwitch(hass, entry, k, mode_friendly(k), durs.get(k, 0)))
+        entities.append(ModeSwitch(hass, entry, k, mode_friendly(k), durs.get(k, 0), is_custom=False))
     # Calendar override per mode
     for k in enabled:
-        entities.append(CalendarOverrideSwitch(hass, entry, k, mode_friendly(k)))
+        entities.append(CalendarOverrideSwitch(hass, entry, k, mode_friendly(k), is_custom=False))
 
     # Custom calendar switches (normalized format)
     custom_calendars = normalize_custom_calendars(opts.get(OPT_CUSTOM_CALENDARS, []))
+    custom_cal_ids = []
     for custom_cal in custom_calendars:
         cal_id = custom_cal["id"]
         cal_name = custom_cal["name"]
-        entities.append(ModeSwitch(hass, entry, cal_id, cal_name, 0))
-        entities.append(CalendarOverrideSwitch(hass, entry, cal_id, cal_name))
+        custom_cal_ids.append(cal_id)
+        entities.append(ModeSwitch(hass, entry, cal_id, cal_name, 0, is_custom=True))
+        entities.append(CalendarOverrideSwitch(hass, entry, cal_id, cal_name, is_custom=True))
+
+    # Clean up removed custom calendar switch entities from entity registry
+    registry = er.async_get(hass)
+    all_entity_entries = er.async_entries_for_config_entry(registry, entry.entry_id)
+
+    for entity_entry in all_entity_entries:
+        # Check if this is a switch entity
+        if entity_entry.domain == "switch":
+            # Extract mode_key from unique_id
+            # Format can be: {entry_id}_{mode_key} or {entry_id}_{mode_key}_calendar_override
+            unique_id = entity_entry.unique_id
+
+            # Remove the entry_id prefix
+            if unique_id.startswith(f"{entry.entry_id}_"):
+                remainder = unique_id[len(f"{entry.entry_id}_"):]
+
+                # Check if it's a calendar_override switch
+                if remainder.endswith("_calendar_override"):
+                    mode_key = remainder[:-len("_calendar_override")]
+                else:
+                    mode_key = remainder
+
+                # Check if this mode/calendar is still in config
+                is_enabled_mode = mode_key in enabled
+                is_custom_calendar = mode_key in custom_cal_ids
+
+                # If not in either list, remove it
+                if not is_enabled_mode and not is_custom_calendar:
+                    _LOGGER.debug("Removing orphaned switch entity: %s (mode_key: %s)",
+                                 entity_entry.entity_id, mode_key)
+                    registry.async_remove(entity_entry.entity_id)
+
+    # Clean up orphaned devices (devices with no entities left)
+    device_registry = dr.async_get(hass)
+    all_devices = dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+
+    for device_entry in all_devices:
+        # Check if this device has any entities left
+        device_entities = er.async_entries_for_device(registry, device_entry.id, include_disabled_entities=True)
+
+        # If the device has no entities, remove it
+        if not device_entities:
+            # Extract mode_key from device identifiers to log it
+            mode_key = None
+            for identifier_tuple in device_entry.identifiers:
+                if len(identifier_tuple) == 3 and identifier_tuple[0] == DOMAIN:
+                    mode_key = identifier_tuple[2]
+                    break
+
+            # Don't remove the main device
+            if mode_key != "main":
+                _LOGGER.debug("Removing orphaned device: %s (mode_key: %s)",
+                             device_entry.name, mode_key)
+                device_registry.async_remove_device(device_entry.id)
 
     async_add_entities(entities, True)
 
@@ -73,10 +132,12 @@ class ModeSwitch(SwitchEntity, RestoreEntity):
     _attr_should_poll = False
     _attr_entity_category = EntityCategory.CONFIG
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, key: str, name: str, default_minutes: int):
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, key: str, name: str, default_minutes: int, is_custom: bool = False):
         self.hass = hass
         self._entry = entry
         self._key = key
+        self._friendly_name = name
+        self._is_custom = is_custom
         self._attr_name = name
         self._attr_unique_id = f"{entry.entry_id}_{key}"  # stable for registry & restore
         self.entity_id = f"switch.{key}"  # explicit entity_id to match binary sensor expectations
@@ -89,6 +150,14 @@ class ModeSwitch(SwitchEntity, RestoreEntity):
 
     @property
     def device_info(self):
+        # For custom calendars, use the custom name directly
+        if self._is_custom:
+            return {
+                "identifiers": {(DOMAIN, self._entry.entry_id, self._key)},
+                "manufacturer": "OnOff Automations",
+                "name": self._friendly_name,
+                "model": "Mode",
+            }
         return device_info_for_mode(self._entry.entry_id, self._key)
 
     @property
@@ -173,9 +242,15 @@ class ModeSwitch(SwitchEntity, RestoreEntity):
                     self._is_on = True
                     self.async_write_ha_state()
 
-            self.async_on_remove(
-                self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _reassert_on_started)
-            )
+            # Register listener with safe removal (async_listen_once auto-removes, so no need for async_on_remove)
+            try:
+                unsub = self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _reassert_on_started)
+                # Only register for removal if the event hasn't fired yet
+                if unsub is not None:
+                    self.async_on_remove(unsub)
+            except Exception:
+                # Event may have already fired, ignore
+                pass
 
     async def async_turn_on(self, **kwargs):
         self._is_on = True
@@ -220,10 +295,12 @@ class CalendarOverrideSwitch(SwitchEntity, RestoreEntity):
     _attr_should_poll = False
     _attr_entity_category = EntityCategory.CONFIG
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, key: str, name: str):
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, key: str, name: str, is_custom: bool = False):
         self.hass = hass
         self._entry = entry
         self._key = key
+        self._friendly_name = name
+        self._is_custom = is_custom
         self._attr_name = f"{name} Calendar Override"
         self._attr_unique_id = f"{entry.entry_id}_{key}_calendar_override"
         self.entity_id = f"switch.{key}_calendar_override"  # explicit entity_id to match binary sensor expectations
@@ -231,6 +308,14 @@ class CalendarOverrideSwitch(SwitchEntity, RestoreEntity):
 
     @property
     def device_info(self):
+        # For custom calendars, use the custom name directly
+        if self._is_custom:
+            return {
+                "identifiers": {(DOMAIN, self._entry.entry_id, self._key)},
+                "manufacturer": "OnOff Automations",
+                "name": self._friendly_name,
+                "model": "Mode",
+            }
         return device_info_for_mode(self._entry.entry_id, self._key)
 
     @property

@@ -66,6 +66,14 @@ DEFAULT_OPTIONS = {
 }
 
 
+def format_custom_name(name: str) -> str:
+    """Format custom calendar names by replacing underscores with spaces and capitalizing words."""
+    if not name:
+        return name
+    # Replace underscores with spaces and capitalize each word
+    return name.replace("_", " ").title()
+
+
 def normalize_custom_calendars(custom_cals: List) -> List[Dict[str, str]]:
     """Normalize custom calendars to new format {id, name}."""
     normalized = []
@@ -75,10 +83,13 @@ def normalize_custom_calendars(custom_cals: List) -> List[Dict[str, str]]:
         if isinstance(cal, str):
             # Convert old format (string) to new format (dict)
             cal_id = cal.lower().replace(" ", "_")
-            normalized.append({"id": cal_id, "name": cal})
+            # Format the name to have proper capitalization and spaces
+            cal_name = format_custom_name(cal)
+            normalized.append({"id": cal_id, "name": cal_name})
         elif isinstance(cal, dict) and cal.get("id") and cal.get("name"):
-            # Already in new format
-            normalized.append({"id": cal["id"], "name": cal["name"]})
+            # Already in new format - format the name to ensure proper display
+            formatted_name = format_custom_name(cal["name"])
+            normalized.append({"id": cal["id"], "name": formatted_name})
     return normalized
 
 
